@@ -24,7 +24,7 @@ Values update dynamically whenever quality is adjusted via the settings menu.
 
 1. Install a userscript extension such as [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/).
 2. Open your extension dashboard and create a new script.
-3. Paste the contents of [`youtube-quality-hud.user.js`](youtube-quality-hud.user.js).
+3. Paste the contents of [`youtube-quality-hud.user.js`](https://github.com/hv33y/yt-quality-hud/raw/refs/heads/master/youtube-quality-hud.user.js).
 4. Save the file and visit any video on YouTube.
 
 ## How It Works

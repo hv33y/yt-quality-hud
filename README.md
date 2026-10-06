@@ -1,36 +1,46 @@
 # YouTube Quality HUD
 
-A lightweight userscript that injects active playback resolution and native upload master quality directly beside the YouTube Subscribe button.
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
-## Overview
+A lightweight userscript that shows live playback resolution and the video's native upload quality right next to the Subscribe button, with a one-click quality switcher.
 
-YouTube dynamically scales video playback depending on viewport size, network conditions, and player settings. Determining whether you are viewing the video at its native uploaded quality or a downscaled version normally requires opening Stats for Nerds.
+## What you get
 
-This script hooks into YouTube's player instance and streaming formats to display two clear metrics:
-* **Active Quality:** The current rendered stream resolution and frame rate.
-* **Maximum Quality:** The highest available encoded tier uploaded by the creator.
+- **Active quality**: the resolution and frame rate currently being rendered (e.g. `1080p 60fps`)
+- **Max quality**: the highest encoded tier the creator uploaded (e.g. `4K 60fps`)
+- **Quality switcher**: a button next to the badge that lists every available quality from the player and switches with one click
 
-Values update dynamically whenever quality is adjusted via the settings menu.
+No need to open Stats for Nerds or dig through the settings gear menu anymore.
 
 ## Features
 
-* Automatic resolution labeling (4K, 1440p, 1080p, 720p).
-* Live frame rate detection.
-* Immediate update on stream resize without requiring a page refresh.
-* Native YouTube button styling.
-* Zero external libraries or runtime dependencies.
+- Automatic resolution labeling (4K, 1440p, 1080p, 720p, 480p)
+- Live frame rate detection from player stats
+- Updates instantly when the stream resizes or you change quality
+- Native YouTube pill styling, works in light and dark mode
+- Zero external libraries or dependencies
 
 ## Installation
 
-1. Install a userscript extension such as [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/).
-2. Open your extension dashboard and create a new script.
-3. Paste the contents of [`youtube-quality-hud.user.js`](https://github.com/hv33y/yt-quality-hud/raw/refs/heads/master/youtube-quality-hud.user.js).
-4. Save the file and visit any video on YouTube.
+1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
+2. Create a new script in the dashboard
+3. Paste the contents of [`youtube-quality-hud.user.js`](https://github.com/hv33y/yt-quality-hud/raw/refs/heads/master/youtube-quality-hud.user.js)
+4. Save, then open any YouTube video
 
-## How It Works
+## Usage
 
-* **Active Playback:** Inspects the active HTML5 video element dimensions alongside the player runtime stats to calculate real-time decoding targets.
-* **Max Resolution:** Parses the manifest streams in `streamingData.adaptiveFormats`, selects video feeds, and sorts by total pixel surface area to extract the upload ceiling.
+Look to the right of the Subscribe button under any video:
+
+- The first pill reads like `1080p 60fps / Max: 4K 60fps`
+- The second pill shows the current quality setting, click it to pick a different one (Auto included)
+
+The HUD hides itself on non-video pages and reattaches as you navigate.
+
+## How it works
+
+- **Active playback**: reads the dimensions of the active HTML5 `<video>` element and the frame rate from the player's Stats for Nerds data
+- **Max resolution**: parses `streamingData.adaptiveFormats` from the player response, filters video streams, and sorts by total pixel area (breaking ties by frame rate) to find the upload ceiling
+- **Quality switcher**: uses the player's `getAvailableQualityLevels()` and `setPlaybackQualityRange()` APIs
 
 ## Author
 

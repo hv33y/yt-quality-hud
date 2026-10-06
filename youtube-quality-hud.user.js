@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         YouTube Resolution & FPS Badge (Current & Max)
+// @name         YouTube Resolution & FPS Badge (Current & Max) + Quality Switcher
 // @namespace    https://github.com/hv33y
-// @version      1.0
-// @description  Displays both active playback and maximum original resolution/fps next to the Subscribe button
+// @version      1.1
+// @description  Displays both active playback and maximum original resolution/fps next to the Subscribe button, plus a one-click quality changer
 // @author       github.com/hv33y
 // @match        https://www.youtube.com/*
 // @grant        none
@@ -12,7 +12,11 @@
 (function () {
   'use strict';
 
+  const WRAP_ID = 'yt-dual-res-wrap';
   const BADGE_ID = 'yt-dual-res-badge';
+  const QBTN_ID = 'yt-dual-res-qbtn';
+  const QLABEL_ID = 'yt-dual-res-qlabel';
+  const MENU_ID = 'yt-dual-res-qmenu';
 
   function formatQuality(height, fps) {
     if (!height) return '...';
@@ -34,8 +38,12 @@
     return `${resName}${fpsName}`;
   }
 
+  function getMoviePlayer() {
+    return document.getElementById('movie_player');
+  }
+
   function getMaxSpecs() {
-    const moviePlayer = document.getElementById('movie_player');
+    const moviePlayer = getMoviePlayer();
     let formats = [];
 
     if (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function') {
@@ -66,7 +74,7 @@
   }
 
   function getActiveSpecs() {
-    const moviePlayer = document.getElementById('movie_player');
+    const moviePlayer = getMoviePlayer();
     const video = document.querySelector('video');
 
     if (!video || !video.videoWidth || !video.videoHeight) {
@@ -87,29 +95,121 @@
     };
   }
 
-  function updateBadge() {
-    if (!window.location.pathname.startsWith('/watch')) {
-      const existing = document.getElementById(BADGE_ID);
-      if (existing) existing.remove();
-      return;
+  const QUALITY_LABELS = {
+    hd2160: '4K',
+    hd1440: '1440p',
+    hd1080: '1080p',
+    hd720: '720p',
+    large: '480p',
+    medium: '360p',
+    small: '240p',
+    tiny: '144p',
+    auto: 'Auto'
+  };
+
+  function qualityLabel(level) {
+    return QUALITY_LABELS[level] || level || 'Quality';
+  }
+
+  function closeMenu() {
+    const menu = document.getElementById(MENU_ID);
+    if (menu) menu.remove();
+  }
+
+  function setQuality(level) {
+    const mp = getMoviePlayer();
+    if (!mp || typeof mp.setPlaybackQualityRange !== 'function') return;
+    try {
+      mp.setPlaybackQualityRange(level, level);
+    } catch (e) { /* player busy, ignore */ }
+    closeMenu();
+    setTimeout(updateBadge, 500);
+  }
+
+  function toggleMenu() {
+    const existing = document.getElementById(MENU_ID);
+    if (existing) { existing.remove(); return; }
+
+    const mp = getMoviePlayer();
+    let levels = [];
+    if (mp && typeof mp.getAvailableQualityLevels === 'function') {
+      try { levels = mp.getAvailableQualityLevels() || []; } catch (e) {}
     }
 
-    const maxSpecs = getMaxSpecs();
-    const activeSpecs = getActiveSpecs();
+    const ordered = [];
+    if (levels.includes('auto')) ordered.push('auto');
+    ['hd2160', 'hd1440', 'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'].forEach(l => {
+      if (levels.includes(l)) ordered.push(l);
+    });
 
-    if (!maxSpecs && !activeSpecs) return;
+    let current = '';
+    if (mp && typeof mp.getPlaybackQuality === 'function') {
+      try { current = mp.getPlaybackQuality() || ''; } catch (e) {}
+    }
 
+    const btn = document.getElementById(QBTN_ID);
+    if (!btn) return;
+
+    const menu = document.createElement('div');
+    menu.id = MENU_ID;
+    menu.style.position = 'absolute';
+    menu.style.bottom = '44px';
+    menu.style.right = '0';
+    menu.style.minWidth = '150px';
+    menu.style.backgroundColor = '#212121';
+    menu.style.borderRadius = '12px';
+    menu.style.padding = '6px 0';
+    menu.style.zIndex = '9999';
+    menu.style.boxShadow = '0 8px 24px rgba(0,0,0,0.55)';
+    menu.style.overflow = 'hidden';
+
+    if (!ordered.length) {
+      const empty = document.createElement('div');
+      empty.textContent = 'No qualities found';
+      empty.style.padding = '10px 16px';
+      empty.style.fontSize = '13px';
+      empty.style.color = '#aaa';
+      menu.appendChild(empty);
+    }
+
+    ordered.forEach(level => {
+      const isCurrent = level === current;
+      const item = document.createElement('div');
+      item.textContent = (isCurrent ? '\u2713 ' : '') + qualityLabel(level);
+      item.style.padding = '9px 16px';
+      item.style.fontSize = '13px';
+      item.style.color = '#fff';
+      item.style.cursor = 'pointer';
+      item.style.fontWeight = isCurrent ? '600' : '400';
+      item.style.backgroundColor = isCurrent ? 'rgba(255,255,255,0.12)' : 'transparent';
+      item.addEventListener('mouseenter', () => { if (!isCurrent) item.style.backgroundColor = 'rgba(255,255,255,0.08)'; });
+      item.addEventListener('mouseleave', () => { if (!isCurrent) item.style.backgroundColor = 'transparent'; });
+      item.addEventListener('click', (e) => { e.stopPropagation(); setQuality(level); });
+      menu.appendChild(item);
+    });
+
+    btn.appendChild(menu);
+  }
+
+  function buildUI() {
     const subscribeContainer = document.querySelector('#owner #subscribe-button, ytd-watch-metadata #subscribe-button');
-    if (!subscribeContainer) return;
+    if (!subscribeContainer) return null;
 
-    let badge = document.getElementById(BADGE_ID);
-    if (!badge) {
-      badge = document.createElement('div');
+    let wrap = document.getElementById(WRAP_ID);
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = WRAP_ID;
+      wrap.style.display = 'inline-flex';
+      wrap.style.alignItems = 'center';
+      wrap.style.gap = '8px';
+      wrap.style.marginLeft = '10px';
+      wrap.style.verticalAlign = 'middle';
+
+      const badge = document.createElement('div');
       badge.id = BADGE_ID;
       badge.style.display = 'inline-flex';
       badge.style.alignItems = 'center';
       badge.style.justifyContent = 'center';
-      badge.style.marginLeft = '10px';
       badge.style.padding = '0 14px';
       badge.style.height = '36px';
       badge.style.borderRadius = '18px';
@@ -118,17 +218,70 @@
       badge.style.fontSize = '12px';
       badge.style.fontWeight = '500';
       badge.style.letterSpacing = '0.3px';
-      badge.style.verticalAlign = 'middle';
       badge.style.userSelect = 'none';
+      badge.style.whiteSpace = 'nowrap';
 
-      subscribeContainer.parentNode.insertBefore(badge, subscribeContainer.nextSibling);
+      const btn = document.createElement('div');
+      btn.id = QBTN_ID;
+      btn.style.position = 'relative';
+      btn.style.display = 'inline-flex';
+      btn.style.alignItems = 'center';
+      btn.style.justifyContent = 'center';
+      btn.style.height = '36px';
+      btn.style.padding = '0 14px';
+      btn.style.borderRadius = '18px';
+      btn.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+      btn.style.color = 'var(--yt-spec-text-primary, #fff)';
+      btn.style.fontSize = '12px';
+      btn.style.fontWeight = '500';
+      btn.style.cursor = 'pointer';
+      btn.style.userSelect = 'none';
+      btn.style.whiteSpace = 'nowrap';
+      btn.title = 'Change playback quality';
+
+      const label = document.createElement('span');
+      label.id = QLABEL_ID;
+      btn.appendChild(label);
+
+      btn.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(); });
+
+      wrap.appendChild(badge);
+      wrap.appendChild(btn);
+      subscribeContainer.parentNode.insertBefore(wrap, subscribeContainer.nextSibling);
     }
+    return wrap;
+  }
+
+  function updateBadge() {
+    if (!window.location.pathname.startsWith('/watch')) {
+      const existing = document.getElementById(WRAP_ID);
+      if (existing) existing.remove();
+      closeMenu();
+      return;
+    }
+
+    const maxSpecs = getMaxSpecs();
+    const activeSpecs = getActiveSpecs();
+
+    if (!maxSpecs && !activeSpecs) return;
+    if (!buildUI()) return;
+
+    const badge = document.getElementById(BADGE_ID);
+    const qlabel = document.getElementById(QLABEL_ID);
 
     const activeText = activeSpecs ? formatQuality(activeSpecs.height, activeSpecs.fps) : '...';
     const maxText = maxSpecs ? formatQuality(maxSpecs.height, maxSpecs.fps) : '...';
 
-    // Renders like: "1080p 60fps / Max: 4K 60fps"
-    badge.textContent = `${activeText} / Max: ${maxText}`;
+    if (badge) badge.textContent = `${activeText} / Max: ${maxText}`;
+
+    if (qlabel) {
+      const mp = getMoviePlayer();
+      let q = '';
+      if (mp && typeof mp.getPlaybackQuality === 'function') {
+        try { q = mp.getPlaybackQuality() || ''; } catch (e) {}
+      }
+      qlabel.textContent = '\u2699 ' + qualityLabel(q);
+    }
   }
 
   function attachVideoListener() {
@@ -138,6 +291,14 @@
       video.addEventListener('resize', updateBadge);
     }
   }
+
+  document.addEventListener('click', () => {
+    const menu = document.getElementById(MENU_ID);
+    if (menu) menu.remove();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeMenu();
+  });
 
   window.addEventListener('yt-navigate-finish', () => {
     attachVideoListener();

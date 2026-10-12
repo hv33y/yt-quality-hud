@@ -21,8 +21,7 @@
   let lastAnchorMode = 'none';
   let lastDebug = '';
   let lastTheme = null;
-  let forceFloat = false;
-  let hiddenCount = 0;
+  let noAnchorTicks = 0;
 
   function isDarkTheme() {
     const html = document.documentElement;
@@ -51,16 +50,7 @@
     return dark;
   }
 
-  // True if the wrap is really rendered and not clipped/covered by something
-  function isWrapVisible(wrap) {
-    const r = wrap.getBoundingClientRect();
-    if (!r.width || !r.height) return false;
-    const cx = r.left + r.width / 2;
-    const cy = r.top + r.height / 2;
-    if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return true; // off-screen, can't test
-    const hit = document.elementFromPoint(cx, cy);
-    return !!hit && wrap.contains(hit);
-  }
+
   console.log('[YT-HUD v1.2] script loaded');
 
   function formatQuality(height, fps) {
@@ -308,8 +298,6 @@
   // Find the Subscribe button across old and new YouTube layouts,
   // preferring an element that is actually visible
   function findAnchor() {
-    if (forceFloat && document.body) return { el: document.body, mode: 'float' };
-
     const selectors = [
       '#owner #subscribe-button',
       'ytd-watch-metadata #subscribe-button',
@@ -322,17 +310,19 @@
     for (const sel of selectors) {
       const nodes = document.querySelectorAll(sel);
       for (const n of nodes) {
-        if (n.offsetParent !== null || n.getClientRects().length) return { el: n, mode: 'after' };
+        if (n.offsetParent !== null || n.getClientRects().length) { noAnchorTicks = 0; return { el: n, mode: 'after' }; }
       }
     }
 
     // Last resort: append to the owner row (e.g. you are viewing your own video,
     // where there is no Subscribe button)
     const owner = document.querySelector('ytd-watch-metadata #owner, #owner');
-    if (owner) return { el: owner, mode: 'append' };
+    if (owner) { noAnchorTicks = 0; return { el: owner, mode: 'append' }; }
 
-    // Final fallback: float in the bottom-left corner so the HUD is never invisible
-    if (document.body) return { el: document.body, mode: 'float' };
+    // Final fallback: float in the bottom-left corner, but only after no anchor
+    // has been found for a few seconds (avoids flashing during page loads)
+    noAnchorTicks++;
+    if (noAnchorTicks >= 5 && document.body) return { el: document.body, mode: 'float' };
 
     return null;
   }
@@ -483,18 +473,7 @@
       console.log('[YT-HUD v1.2] theme:', darkNow ? 'dark' : 'light');
     }
 
-    // If the inline spot isn't actually visible, switch to the floating spot
-    if (!forceFloat && lastAnchorMode !== 'float') {
-      if (!isWrapVisible(built)) {
-        hiddenCount++;
-        if (hiddenCount >= 3) {
-          forceFloat = true;
-          console.log('[YT-HUD v1.2] inline spot not visible, switching to floating HUD');
-        }
-      } else {
-        hiddenCount = 0;
-      }
-    }
+
   }
 
   let listenedVideo = null;

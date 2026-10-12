@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Resolution & FPS Badge (Current & Max) + Quality Switcher
 // @namespace    https://github.com/hv33y
-// @version      1.1
+// @version      1.2
 // @description  Displays both active playback and maximum original resolution/fps next to the Subscribe button, plus a one-click quality changer
 // @author       github.com/hv33y
 // @match        https://www.youtube.com/*
@@ -17,6 +17,51 @@
   const QBTN_ID = 'yt-dual-res-qbtn';
   const QLABEL_ID = 'yt-dual-res-qlabel';
   const MENU_ID = 'yt-dual-res-qmenu';
+
+  let lastAnchorMode = 'none';
+  let lastDebug = '';
+  let lastTheme = null;
+  let forceFloat = false;
+  let hiddenCount = 0;
+
+  function isDarkTheme() {
+    const html = document.documentElement;
+    if (html.hasAttribute('dark') || html.getAttribute('data-theme') === 'dark') return true;
+    // Fall back to the page's actual background luminance
+    const m = getComputedStyle(document.body).backgroundColor.match(/\d+(\.\d+)?/g);
+    if (m && m.length >= 3) {
+      const lum = (0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2]);
+      const alpha = m.length > 3 ? parseFloat(m[3]) : 1;
+      if (alpha > 0) return lum < 128;
+    }
+    return false;
+  }
+
+  // Dark mode keeps the original look; light mode gets readable colours
+  function applyTheme() {
+    const dark = isDarkTheme();
+    const bg = dark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)';
+    const fg = dark ? '#fff' : '#0f0f0f';
+    [BADGE_ID, QBTN_ID].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (el.style.backgroundColor !== bg) el.style.backgroundColor = bg;
+      if (el.style.color !== fg) el.style.color = fg;
+    });
+    return dark;
+  }
+
+  // True if the wrap is really rendered and not clipped/covered by something
+  function isWrapVisible(wrap) {
+    const r = wrap.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return true; // off-screen, can't test
+    const hit = document.elementFromPoint(cx, cy);
+    return !!hit && wrap.contains(hit);
+  }
+  console.log('[YT-HUD v1.2] script loaded');
 
   function formatQuality(height, fps) {
     if (!height) return '...';
@@ -39,63 +84,122 @@
   }
 
   function getMoviePlayer() {
-    return document.getElementById('movie_player');
+    // Prefer the watch-page player; fall back to any HTML5 player element
+    const mp = document.getElementById('movie_player');
+    if (mp && typeof mp.getPlayerResponse === 'function') return mp;
+    const alt = document.querySelector('.html5-video-player');
+    return alt || mp;
   }
 
-  function getMaxSpecs() {
-    const moviePlayer = getMoviePlayer();
-    let formats = [];
-
-    if (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function') {
-      const resp = moviePlayer.getPlayerResponse();
-      formats = resp?.streamingData?.adaptiveFormats || [];
+  function getPlayerResponseSafe() {
+    const mp = getMoviePlayer();
+    if (mp && typeof mp.getPlayerResponse === 'function') {
+      try {
+        const resp = mp.getPlayerResponse();
+        if (resp) return resp;
+      } catch (e) { /* ignore */ }
     }
+    return window.ytInitialPlayerResponse || null;
+  }
 
+  function getVideoFormats() {
+    const resp = getPlayerResponseSafe();
+    let formats = resp?.streamingData?.adaptiveFormats || [];
+
+    // ytInitialPlayerResponse can be stale after SPA navigation, but is a
+    // better-than-nothing fallback when the player response has no formats
     if (!formats.length && window.ytInitialPlayerResponse) {
       formats = window.ytInitialPlayerResponse?.streamingData?.adaptiveFormats || [];
     }
 
-    const videoStreams = formats.filter(f => f.width && f.height && f.mimeType?.includes('video'));
-    if (!videoStreams.length) return null;
+    return formats.filter(f => f.width && f.height && (f.mimeType ? f.mimeType.includes('video') : true));
+  }
 
-    videoStreams.sort((a, b) => {
-      const areaA = a.width * a.height;
-      const areaB = b.width * b.height;
-      if (areaB !== areaA) return areaB - areaA;
-      return (b.fps || 0) - (a.fps || 0);
-    });
+  const LEVEL_HEIGHTS = {
+    highres: 4320,
+    hd2880: 2880,
+    hd2160: 2160,
+    hd1440: 1440,
+    hd1080: 1080,
+    hd720: 720,
+    large: 480,
+    medium: 360,
+    small: 240,
+    tiny: 144
+  };
 
-    const best = videoStreams[0];
-    return {
-      width: best.width,
-      height: best.height,
-      fps: best.fps || 30
-    };
+  function getMaxSpecs() {
+    const videoStreams = getVideoFormats();
+
+    if (videoStreams.length) {
+      videoStreams.sort((a, b) => {
+        const areaA = a.width * a.height;
+        const areaB = b.width * b.height;
+        if (areaB !== areaA) return areaB - areaA;
+        return (b.fps || 0) - (a.fps || 0);
+      });
+
+      const best = videoStreams[0];
+      return {
+        width: best.width,
+        height: best.height,
+        fps: best.fps || 30
+      };
+    }
+
+    // Fallback: formats are hidden (e.g. SABR streaming), so derive the
+    // ceiling from the quality levels the player reports
+    const mp = getMoviePlayer();
+    if (mp && typeof mp.getAvailableQualityLevels === 'function') {
+      try {
+        const levels = mp.getAvailableQualityLevels() || [];
+        let maxH = 0;
+        levels.forEach(l => {
+          if (LEVEL_HEIGHTS[l] && LEVEL_HEIGHTS[l] > maxH) maxH = LEVEL_HEIGHTS[l];
+        });
+        if (maxH) return { width: 0, height: maxH, fps: null };
+      } catch (e) { /* ignore */ }
+    }
+
+    return null;
   }
 
   function getActiveSpecs() {
     const moviePlayer = getMoviePlayer();
-    const video = document.querySelector('video');
+    const video = document.querySelector('#movie_player video, video.html5-main-video, video');
 
     if (!video || !video.videoWidth || !video.videoHeight) {
       return null;
     }
 
-    let fps = 30;
+    let fps = null;
     if (moviePlayer && typeof moviePlayer.getStatsForNerds === 'function') {
-      const stats = moviePlayer.getStatsForNerds();
-      const match = stats?.resolution?.match(/@(\d+)/);
-      if (match) fps = parseInt(match[1], 10);
+      try {
+        const stats = moviePlayer.getStatsForNerds();
+        const text = [stats?.resolution, stats?.currentResolution, stats?.optimalResolution]
+          .filter(Boolean)
+          .join(' ');
+        const match = text.match(/@\s*(\d+)/);
+        if (match) fps = parseInt(match[1], 10);
+      } catch (e) { /* ignore */ }
+    }
+
+    // Fallback: use the highest fps encoded at the currently playing height
+    if (!fps) {
+      const sameHeight = getVideoFormats().filter(f => f.height === video.videoHeight && f.fps);
+      if (sameHeight.length) fps = Math.max(...sameHeight.map(f => f.fps));
     }
 
     return {
       width: video.videoWidth,
       height: video.videoHeight,
-      fps: fps
+      fps: fps || 30
     };
   }
 
   const QUALITY_LABELS = {
+    highres: '8K',
+    hd2880: '5K',
     hd2160: '4K',
     hd1440: '1440p',
     hd1080: '1080p',
@@ -118,12 +222,22 @@
 
   function setQuality(level) {
     const mp = getMoviePlayer();
-    if (!mp || typeof mp.setPlaybackQualityRange !== 'function') return;
+    if (!mp) return;
     try {
-      mp.setPlaybackQualityRange(level, level);
+      if (typeof mp.setPlaybackQualityRange === 'function') {
+        if (level === 'auto') {
+          mp.setPlaybackQualityRange('tiny', 'highres');
+        } else {
+          mp.setPlaybackQualityRange(level, level);
+        }
+      }
+      if (typeof mp.setPlaybackQuality === 'function') {
+        mp.setPlaybackQuality(level);
+      }
     } catch (e) { /* player busy, ignore */ }
     closeMenu();
     setTimeout(updateBadge, 500);
+    setTimeout(updateBadge, 1500);
   }
 
   function toggleMenu() {
@@ -137,8 +251,8 @@
     }
 
     const ordered = [];
-    if (levels.includes('auto')) ordered.push('auto');
-    ['hd2160', 'hd1440', 'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'].forEach(l => {
+    ordered.push('auto');
+    ['highres', 'hd2880', 'hd2160', 'hd1440', 'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'].forEach(l => {
       if (levels.includes(l)) ordered.push(l);
     });
 
@@ -163,7 +277,7 @@
     menu.style.boxShadow = '0 8px 24px rgba(0,0,0,0.55)';
     menu.style.overflow = 'hidden';
 
-    if (!ordered.length) {
+    if (ordered.length <= 1 && !levels.length) {
       const empty = document.createElement('div');
       empty.textContent = 'No qualities found';
       empty.style.padding = '10px 16px';
@@ -191,11 +305,47 @@
     btn.appendChild(menu);
   }
 
+  // Find the Subscribe button across old and new YouTube layouts,
+  // preferring an element that is actually visible
+  function findAnchor() {
+    if (forceFloat && document.body) return { el: document.body, mode: 'float' };
+
+    const selectors = [
+      '#owner #subscribe-button',
+      'ytd-watch-metadata #subscribe-button',
+      '#owner yt-subscribe-button-view-model',
+      'ytd-watch-metadata yt-subscribe-button-view-model',
+      '#owner ytd-subscribe-button-renderer',
+      'ytd-watch-metadata ytd-subscribe-button-renderer'
+    ];
+
+    for (const sel of selectors) {
+      const nodes = document.querySelectorAll(sel);
+      for (const n of nodes) {
+        if (n.offsetParent !== null || n.getClientRects().length) return { el: n, mode: 'after' };
+      }
+    }
+
+    // Last resort: append to the owner row (e.g. you are viewing your own video,
+    // where there is no Subscribe button)
+    const owner = document.querySelector('ytd-watch-metadata #owner, #owner');
+    if (owner) return { el: owner, mode: 'append' };
+
+    // Final fallback: float in the bottom-left corner so the HUD is never invisible
+    if (document.body) return { el: document.body, mode: 'float' };
+
+    return null;
+  }
+
   function buildUI() {
-    const subscribeContainer = document.querySelector('#owner #subscribe-button, ytd-watch-metadata #subscribe-button');
-    if (!subscribeContainer) return null;
+    const anchor = findAnchor();
+    if (!anchor) return null;
 
     let wrap = document.getElementById(WRAP_ID);
+
+    // Re-attach if YouTube re-rendered the area and our wrap was orphaned
+    if (wrap && !wrap.isConnected) wrap = null;
+
     if (!wrap) {
       wrap = document.createElement('div');
       wrap.id = WRAP_ID;
@@ -247,8 +397,32 @@
 
       wrap.appendChild(badge);
       wrap.appendChild(btn);
-      subscribeContainer.parentNode.insertBefore(wrap, subscribeContainer.nextSibling);
     }
+
+    // Make sure the wrap sits right after the anchor (re-check each tick)
+    if (anchor.mode === 'after') {
+      if (wrap.previousSibling !== anchor.el || wrap.parentNode !== anchor.el.parentNode) {
+        anchor.el.parentNode.insertBefore(wrap, anchor.el.nextSibling);
+      }
+    } else if (wrap.parentNode !== anchor.el) {
+      anchor.el.appendChild(wrap);
+    }
+
+    if (anchor.mode === 'float') {
+      wrap.style.position = 'fixed';
+      wrap.style.left = '16px';
+      wrap.style.bottom = '16px';
+      wrap.style.zIndex = '9998';
+      wrap.style.marginLeft = '0';
+    } else if (wrap.style.position === 'fixed') {
+      wrap.style.position = '';
+      wrap.style.left = '';
+      wrap.style.bottom = '';
+      wrap.style.zIndex = '';
+      wrap.style.marginLeft = '10px';
+    }
+
+    lastAnchorMode = anchor.mode;
     return wrap;
   }
 
@@ -263,8 +437,26 @@
     const maxSpecs = getMaxSpecs();
     const activeSpecs = getActiveSpecs();
 
-    if (!maxSpecs && !activeSpecs) return;
-    if (!buildUI()) return;
+    const built = buildUI();
+
+    const mpDbg = getMoviePlayer();
+    const dbg = JSON.stringify({
+      player: !!mpDbg,
+      getPlayerResponse: typeof mpDbg?.getPlayerResponse,
+      getAvailableQualityLevels: typeof mpDbg?.getAvailableQualityLevels,
+      getStatsForNerds: typeof mpDbg?.getStatsForNerds,
+      formats: getVideoFormats().length,
+      max: maxSpecs,
+      active: activeSpecs,
+      anchor: lastAnchorMode,
+      mounted: !!built
+    });
+    if (dbg !== lastDebug) {
+      lastDebug = dbg;
+      console.log('[YT-HUD v1.2]', dbg);
+    }
+
+    if (!built) return;
 
     const badge = document.getElementById(BADGE_ID);
     const qlabel = document.getElementById(QLABEL_ID);
@@ -272,7 +464,8 @@
     const activeText = activeSpecs ? formatQuality(activeSpecs.height, activeSpecs.fps) : '...';
     const maxText = maxSpecs ? formatQuality(maxSpecs.height, maxSpecs.fps) : '...';
 
-    if (badge) badge.textContent = `${activeText} / Max: ${maxText}`;
+    const text = `${activeText} / Max: ${maxText}`;
+    if (badge && badge.textContent !== text) badge.textContent = text;
 
     if (qlabel) {
       const mp = getMoviePlayer();
@@ -280,15 +473,37 @@
       if (mp && typeof mp.getPlaybackQuality === 'function') {
         try { q = mp.getPlaybackQuality() || ''; } catch (e) {}
       }
-      qlabel.textContent = '\u2699 ' + qualityLabel(q);
+      const qText = '\u2699 ' + qualityLabel(q);
+      if (qlabel.textContent !== qText) qlabel.textContent = qText;
+    }
+
+    const darkNow = applyTheme();
+    if (lastTheme !== darkNow) {
+      lastTheme = darkNow;
+      console.log('[YT-HUD v1.2] theme:', darkNow ? 'dark' : 'light');
+    }
+
+    // If the inline spot isn't actually visible, switch to the floating spot
+    if (!forceFloat && lastAnchorMode !== 'float') {
+      if (!isWrapVisible(built)) {
+        hiddenCount++;
+        if (hiddenCount >= 3) {
+          forceFloat = true;
+          console.log('[YT-HUD v1.2] inline spot not visible, switching to floating HUD');
+        }
+      } else {
+        hiddenCount = 0;
+      }
     }
   }
 
+  let listenedVideo = null;
   function attachVideoListener() {
-    const video = document.querySelector('video');
-    if (video) {
-      video.removeEventListener('resize', updateBadge);
+    const video = document.querySelector('#movie_player video, video.html5-main-video, video');
+    if (video && video !== listenedVideo) {
+      if (listenedVideo) listenedVideo.removeEventListener('resize', updateBadge);
       video.addEventListener('resize', updateBadge);
+      listenedVideo = video;
     }
   }
 
@@ -306,6 +521,7 @@
   });
 
   attachVideoListener();
+  updateBadge();
 
   setInterval(() => {
     attachVideoListener();

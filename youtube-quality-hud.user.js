@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Resolution & FPS Badge (Current & Max) + Quality & FPS Switcher
 // @namespace    https://github.com/hv33y
-// @version      1.4
-// @description  Displays both active playback and maximum original resolution/fps next to the Subscribe button, plus one-click quality and FPS changers (Auto, 23, 24, 30, 50, 60 fps) where a manual quality choice always wins over an FPS lock
+// @version      1.5
+// @description  Displays both active playback and maximum original resolution/fps next to the Subscribe button, plus one-click quality and FPS changers (Auto, 23, 24, 30, 50, 60 fps) where a manual quality choice always wins over an FPS lock and Premium users are bumped to the enhanced-bitrate entry
 // @author       github.com/hv33y
 // @match        https://www.youtube.com/*
 // @grant        none
@@ -43,6 +43,53 @@
   // otherwise a stale lock would keep dragging the video back to 4K.
   let fpsLockedHeight = null;
 
+  // Premium handling, v1.5. YouTube gives no clean "is this user
+  // Premium?" flag to a userscript, so this is layered, and it
+  // defaults to the safe side (regular entry, never the popup):
+  //   1. A manual override in the FPS menu, stored on youtube.com
+  //      localStorage ('on' / 'off'). A Premium user whose account
+  //      is not detected any other way can force the bump-up here.
+  //   2. The currently selected native quality row is a Premium
+  //      entry. Only a Premium user can actually be playing one -
+  //      for everyone else clicking it opens the upsell popup
+  //      instead of selecting it - so a checked Premium row is
+  //      proof, and it is remembered for later videos.
+  //   3. That remembered flag, from a previous Premium selection.
+  // If none of those say Premium, the picker stays on the regular
+  // entry, exactly as in v1.5. When Premium is detected, the picker
+  // does the opposite: the Premium entry at the same height/fps
+  // ranks above the regular one, so a Premium user is bumped up
+  // to enhanced bitrate instead of being dropped to regular.
+  let premiumFromCurrentSelection = false;
+  const PREMIUM_OVERRIDE_KEY = 'yt-hud-premium';
+  const PREMIUM_LEARNED_KEY = 'yt-hud-premium-learned';
+  function getPremiumOverride() {
+    try { return localStorage.getItem(PREMIUM_OVERRIDE_KEY); } catch (e) { return null; }
+  }
+  function setPremiumOverride(value) {
+    try {
+      if (value) localStorage.setItem(PREMIUM_OVERRIDE_KEY, value);
+      else localStorage.removeItem(PREMIUM_OVERRIDE_KEY);
+    } catch (e) { /* storage unavailable: override just does not persist */ }
+  }
+  function rememberPremium() {
+    premiumFromCurrentSelection = true;
+    try { localStorage.setItem(PREMIUM_LEARNED_KEY, '1'); } catch (e) { /* ignore */ }
+  }
+  function userHasPremium() {
+    const override = getPremiumOverride();
+    if (override === 'on') return true;
+    if (override === 'off') return false;
+    if (premiumFromCurrentSelection) return true;
+    try { return localStorage.getItem(PREMIUM_LEARNED_KEY) === '1'; } catch (e) { return false; }
+  }
+  function premiumModeLabel() {
+    const override = getPremiumOverride();
+    if (override === 'on') return 'On';
+    if (override === 'off') return 'Off';
+    return 'Auto';
+  }
+
   function isDarkTheme() {
     const html = document.documentElement;
     if (html.hasAttribute('dark') || html.getAttribute('data-theme') === 'dark') return true;
@@ -71,7 +118,7 @@
   }
 
 
-  console.log('[YT-HUD v1.4] script loaded');
+  console.log('[YT-HUD v1.5] script loaded');
 
   function formatQuality(height, fps) {
     if (!height) return '...';
@@ -264,7 +311,7 @@
       if (survives) {
         setTimeout(() => { if (fpsTarget != null) applyFps(fpsTarget, 0, false); }, 2000);
       } else {
-        console.log('[YT-HUD v1.6] manual quality wins, fps lock cleared', JSON.stringify({ level, newHeight, fpsTarget }));
+        console.log('[YT-HUD v1.5] manual quality wins, fps lock cleared', JSON.stringify({ level, newHeight, fpsTarget }));
         fpsTarget = null;
         fpsDropFromHeight = null;
         fpsLockedHeight = null;
@@ -452,7 +499,10 @@
       const qd = getQualityDataEntries();
       if (!qd.length) return null;
       effective = new Map();
-      qd.forEach(e => { if (e.fps) effective.set(e.height, e.fps); });
+      // v1.5: Premium entries count for prediction only for Premium
+      // users; otherwise a premium-only height would look offered
+      // when the picker would (correctly) refuse to click it.
+      qd.forEach(e => { if (e.fps && (userHasPremium() || !e.isPremium)) effective.set(e.height, e.fps); });
       if (!effective.size) return null;
     }
     const candidates = [...effective.entries()]
@@ -509,13 +559,20 @@
   // "720s50" (360 video), "1080p", "Auto". Plain (no fps suffix) means
   // the non-HFR stream at that height, usually 30fps (or the video's
   // native fps when no HFR variant exists).
+  // isPremium is critical: "1080p Premium / Enhanced bitrate" is a
+  // paid stream, not a different fps or resolution. Clicking it as a
+  // non-Premium user opens YouTube's Premium upsell popup instead of
+  // changing the stream, so the FPS picker must never pick it when a
+  // regular entry at the same height/fps exists - and must not pick
+  // it at all just to satisfy an fps target.
   function parseNativeQualityLabel(text) {
     if (!text) return null;
     const t = text.trim();
-    if (/^auto/i.test(t)) return { height: null, fps: null, isAuto: true, text: t };
+    const isPremium = /premium|enhanced bitrate/i.test(t);
+    if (/^auto/i.test(t)) return { height: null, fps: null, isAuto: true, isPremium, text: t };
     const m = t.match(/(\d+)[ps](\d+)?/i);
     if (!m) return null;
-    return { height: parseInt(m[1], 10), fps: m[2] ? parseInt(m[2], 10) : null, isAuto: false, text: t };
+    return { height: parseInt(m[1], 10), fps: m[2] ? parseInt(m[2], 10) : null, isAuto: false, isPremium, text: t };
   }
 
   function waitFor(fn, timeoutMs, intervalMs) {
@@ -586,10 +643,24 @@
       const parsed = rows.map(row => {
         const label = row.querySelector('.ytp-menuitem-label');
         const text = (label ? label.textContent : row.textContent || '').trim();
-        return { row, parsed: parseNativeQualityLabel(text), text };
+        const parsedLabel = parseNativeQualityLabel(text);
+        if (parsedLabel && /premium|enhanced bitrate/i.test(row.textContent || '')) {
+          parsedLabel.isPremium = true;
+        }
+        // YouTube marks the selected menu item with aria-checked
+        // (menuitemradio) and/or a checked class.
+        const isSelected = row.getAttribute('aria-checked') === 'true' ||
+          row.classList.contains('ytp-menuitem-checked');
+        return { row, parsed: parsedLabel, text, isSelected };
       }).filter(x => x.parsed);
       return parsed.length ? parsed : null;
     }, 1500, 100);
+    // v1.5: a checked Premium row proves the user is Premium (see
+    // userHasPremium above), so remember it before picking.
+    premiumFromCurrentSelection = false;
+    if (qualityItems && qualityItems.some(x => x.isSelected && x.parsed.isPremium)) {
+      rememberPremium();
+    }
     return qualityItems;
   }
 
@@ -623,8 +694,27 @@
       return { ...item, score, height: height || 0 };
     }).filter(x => x.score >= 0);
 
-    scored.sort((a, b) => (b.score - a.score) || (b.height - a.height));
-    return scored.length ? scored[0] : null;
+    // v1.5: Premium preference is a tie-breaker inside the same
+    // score/height, never a reason to change height or fps. Premium
+    // users get the Premium entry bumped above the regular one;
+    // everyone else gets the regular one, and if only Premium
+    // matches, nothing is clicked at all (the popup case).
+    const premiumFirst = (a, b) => (userHasPremium()
+      ? (b.parsed.isPremium - a.parsed.isPremium)
+      : (a.parsed.isPremium - b.parsed.isPremium));
+    scored.sort((a, b) => (b.score - a.score) || (b.height - a.height) || premiumFirst(a, b));
+    // v1.5: never click a Premium entry for an fps change when the
+    // user is not Premium. In the reported bug, "1080p Premium" and
+    // regular "1080p" both scored 90 at 1080p, the Premium one was
+    // first in the menu, so the sort kept it first and clicking it
+    // opened the Premium upsell popup instead of switching to
+    // 24fps. If only Premium entries match, return null - the API
+    // fallback can still try the regular level without opening the
+    // popup, and verification will clear the lock if that fps
+    // genuinely is not available for free.
+    if (userHasPremium()) return scored.length ? scored[0] : null;
+    const nonPremium = scored.filter(x => !x.parsed.isPremium);
+    return nonPremium.length ? nonPremium[0] : null;
   }
 
   async function applyFpsViaNative(target, preferredHeight, allowHeightChange = true) {
@@ -642,9 +732,17 @@
       // If an earlier fps choice dropped the resolution, Auto goes back
       // to the height you came from, not to the video's max - but only
       // when height changes are allowed at all.
+      // v1.5: same Premium rule as pickNativeFpsRow - Premium
+      // users are bumped to the Premium row at the restore/current
+      // height, everyone else never gets a Premium row here either.
+      const premiumSort = (a, b) => ((b.parsed.fps || 0) - (a.parsed.fps || 0)) ||
+        (userHasPremium()
+          ? (b.parsed.isPremium - a.parsed.isPremium)
+          : (a.parsed.isPremium - b.parsed.isPremium));
+      const premiumFilter = (x) => userHasPremium() || !x.parsed.isPremium;
       if (allowHeightChange && fpsDropFromHeight) {
-        const atRestore = qualityItems.filter(x => x.parsed.height === fpsDropFromHeight);
-        atRestore.sort((a, b) => ((b.parsed.fps || 0) - (a.parsed.fps || 0)));
+        const atRestore = qualityItems.filter(x => x.parsed.height === fpsDropFromHeight && premiumFilter(x));
+        atRestore.sort(premiumSort);
         row = atRestore[0] || null;
       }
       if (!row && allowHeightChange) row = qualityItems.find(x => x.parsed.isAuto) || null;
@@ -652,8 +750,8 @@
         // No Auto row (already on a fixed quality): fall back to the
         // highest-fps row at the current height, which is what Auto
         // would pick for that height anyway.
-        const atHeight = itemsForPick.filter(x => x.parsed.height === preferredHeight);
-        atHeight.sort((a, b) => ((b.parsed.fps || 0) - (a.parsed.fps || 0)));
+        const atHeight = itemsForPick.filter(x => x.parsed.height === preferredHeight && premiumFilter(x));
+        atHeight.sort(premiumSort);
         row = atHeight[0] || null;
       }
     } else {
@@ -697,7 +795,7 @@
     updateBadge();
     const active = getActiveSpecs();
     const ok = target == null || (active && fpsMatches(active.fps, target));
-    console.log('[YT-HUD v1.6] fps verify', JSON.stringify({ target, activeFps: active ? active.fps : null, activeHeight: active ? active.height : null, ok, attempt }));
+    console.log('[YT-HUD v1.5] fps verify', JSON.stringify({ target, activeFps: active ? active.fps : null, activeHeight: active ? active.height : null, ok, attempt }));
     if (ok) {
       fpsApplying = false;
       if (active) fpsLockedHeight = active.height;
@@ -720,7 +818,7 @@
       if (fpsVideoId === videoId && fpsTarget === target) {
         fpsTarget = null;
         fpsLockedHeight = null;
-        console.log('[YT-HUD v1.6] fps not available after retry, lock cleared');
+        console.log('[YT-HUD v1.5] fps not available after retry, lock cleared');
         updateBadge();
       }
     }
@@ -744,7 +842,7 @@
       fpsDropFromHeight = preferredHeight;
     }
     if (target == null) fpsDropFromHeight = null;
-    console.log('[YT-HUD v1.6] fps apply', JSON.stringify({ target, viaNative: nativeResult.ok, viaApi: result.ok && !nativeResult.ok, preferredHeight, chosenHeight: result.height, dropFromHeight: fpsDropFromHeight, allowHeightChange }));
+    console.log('[YT-HUD v1.5] fps apply', JSON.stringify({ target, viaNative: nativeResult.ok, viaApi: result.ok && !nativeResult.ok, preferredHeight, chosenHeight: result.height, dropFromHeight: fpsDropFromHeight, allowHeightChange }));
     // Give the player time to switch streams, then check the real fps.
     setTimeout(() => { if (fpsVideoId === videoId) verifyFps(target, videoId, attempt || 0, allowHeightChange); }, 1500);
     setTimeout(updateBadge, 500);
@@ -867,6 +965,32 @@
       }
       menu.appendChild(item);
     });
+
+    // v1.5: Premium override, cycling Auto -> On -> Off -> Auto.
+    // Auto is the detector above (checked Premium row / remembered
+    // Premium selection); On forces the bump-up for a Premium user
+    // the detector missed; Off forces regular for everyone. This row
+    // never clicks a Premium stream by itself - it only changes
+    // what the next FPS pick prefers.
+    const premiumRow = document.createElement('div');
+    const premiumState = premiumModeLabel();
+    premiumRow.textContent = `Premium: ${premiumState}` + (userHasPremium() ? ' \u00b7 enhanced bitrate' : '');
+    premiumRow.title = 'Auto: bump to Premium only if Premium is detected. On: always prefer the Premium entry. Off: always use the regular entry.';
+    premiumRow.style.padding = '9px 16px';
+    premiumRow.style.fontSize = '13px';
+    premiumRow.style.color = '#fff';
+    premiumRow.style.cursor = 'pointer';
+    premiumRow.style.borderTop = '1px solid rgba(255,255,255,0.12)';
+    premiumRow.addEventListener('mouseenter', () => { premiumRow.style.backgroundColor = 'rgba(255,255,255,0.08)'; });
+    premiumRow.addEventListener('mouseleave', () => { premiumRow.style.backgroundColor = 'transparent'; });
+    premiumRow.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const current = getPremiumOverride();
+      setPremiumOverride(current == null ? 'on' : current === 'on' ? 'off' : null);
+      menu.remove();
+      toggleFpsMenu();
+    });
+    menu.appendChild(premiumRow);
 
     btn.appendChild(menu);
   }
@@ -1119,7 +1243,7 @@
       if (activeSpecs.fps && fpsMatches(activeSpecs.fps, fpsTarget)) {
         fpsLockedHeight = activeSpecs.height;
       } else {
-        console.log('[YT-HUD v1.6] playing height changed, fps lock cleared (manual quality wins)', JSON.stringify({ fpsTarget, wasHeight: fpsLockedHeight, nowHeight: activeSpecs.height, nowFps: activeSpecs.fps }));
+        console.log('[YT-HUD v1.5] playing height changed, fps lock cleared (manual quality wins)', JSON.stringify({ fpsTarget, wasHeight: fpsLockedHeight, nowHeight: activeSpecs.height, nowFps: activeSpecs.fps }));
         fpsTarget = null;
         fpsDropFromHeight = null;
         fpsLockedHeight = null;
@@ -1144,7 +1268,7 @@
     });
     if (dbg !== lastDebug) {
       lastDebug = dbg;
-      console.log('[YT-HUD v1.6]', dbg);
+      console.log('[YT-HUD v1.5]', dbg);
     }
 
     if (!built) return;
@@ -1182,7 +1306,7 @@
     const darkNow = applyTheme();
     if (lastTheme !== darkNow) {
       lastTheme = darkNow;
-      console.log('[YT-HUD v1.6] theme:', darkNow ? 'dark' : 'light');
+      console.log('[YT-HUD v1.5] theme:', darkNow ? 'dark' : 'light');
     }
 
 

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Resolution & FPS Badge (Current & Max) + Quality & FPS Switcher
 // @namespace    https://github.com/hv33y
-// @version      1.3
-// @description  Displays both active playback and maximum original resolution/fps next to the Subscribe button, plus one-click quality and FPS changers (Auto, 23, 24, 30, 50, 60 fps)
+// @version      1.4
+// @description  Displays both active playback and maximum original resolution/fps next to the Subscribe button, plus one-click quality and FPS changers (Auto, 23, 24, 30, 50, 60 fps) where a manual quality choice always wins over an FPS lock
 // @author       github.com/hv33y
 // @match        https://www.youtube.com/*
 // @grant        none
@@ -30,9 +30,18 @@
   // chosen for one video never silently downgrades the next one.
   let fpsTarget = null;
   let fpsVideoId = null;
+  // Height the user was at before an fps choice dropped the resolution
+  // (e.g. 1080p60 -> 480p30). Used to restore that height when they go
+  // back to 60fps / Auto, instead of jumping to the video's max.
+  let fpsDropFromHeight = null;
   let fpsApplying = false;
   let fpsApplyAttempts = 0;
   let fpsLastApplyAt = 0;
+  // Height a verified fps lock is actually playing at. If the playing
+  // height later changes to something else (manual quality change, or
+  // YouTube adapting), that change wins and the lock is cleared -
+  // otherwise a stale lock would keep dragging the video back to 4K.
+  let fpsLockedHeight = null;
 
   function isDarkTheme() {
     const html = document.documentElement;
@@ -62,7 +71,7 @@
   }
 
 
-  console.log('[YT-HUD v1.3] script loaded');
+  console.log('[YT-HUD v1.4] script loaded');
 
   function formatQuality(height, fps) {
     if (!height) return '...';
@@ -241,10 +250,26 @@
     closeMenu();
     setTimeout(updateBadge, 500);
     setTimeout(updateBadge, 1500);
-    // Changing resolution must not silently drop an fps lock: re-apply
-    // it at the new height once the quality switch has settled.
+    // v1.6: a manual quality choice ALWAYS wins over an fps lock.
+    // v1.5 re-applied the lock after every quality change, so picking
+    // 144p with an FPS:60 lock on would, 2 seconds later, re-apply
+    // 60fps at the highest height that offers it - i.e. back to 4K.
+    // That is the auto-upgrade the user reported. Now: the lock only
+    // survives if it fits the new height exactly (same-height re-apply,
+    // never an upgrade or a drop). Otherwise it is cleared immediately,
+    // so nothing can fire later and drag the video back up.
     if (fpsTarget != null) {
-      setTimeout(() => { if (fpsTarget != null) applyFps(fpsTarget, 0); }, 2000);
+      const newHeight = level === 'auto' ? null : (LEVEL_HEIGHTS[level] || null);
+      const survives = newHeight != null && predictFpsHeight(fpsTarget, newHeight) === newHeight;
+      if (survives) {
+        setTimeout(() => { if (fpsTarget != null) applyFps(fpsTarget, 0, false); }, 2000);
+      } else {
+        console.log('[YT-HUD v1.6] manual quality wins, fps lock cleared', JSON.stringify({ level, newHeight, fpsTarget }));
+        fpsTarget = null;
+        fpsDropFromHeight = null;
+        fpsLockedHeight = null;
+        setTimeout(updateBadge, 2100);
+      }
     }
   }
 
@@ -262,10 +287,40 @@
   // of just relabelling something. This is also the technique used by
   // the "YouTube Auto HD + FPS" extension.
   //
+  // YouTube limitation that shapes this whole controller: for a video
+  // uploaded at 60fps, YouTube does NOT encode a 1080p30 / 4K30 stream.
+  // Its menu is typically 2160p60, 1440p60, 1080p60, 720p60, then plain
+  // 480p, 360p, 240p - and Google's own help says exactly that: to watch
+  // at a lower frame rate, switch to 480p or lower. So "30fps" on such a
+  // video cannot mean "same height, fewer frames" inside YouTube's
+  // player; it means dropping to the highest height that has a 30fps
+  // stream. v1.3 did that silently, which is why it felt broken even
+  // though it was technically correct. v1.4 therefore never drops
+  // silently: the menu labels the drop ("30 fps · ↓480p") before you
+  // click, and going back to 60fps/Auto restores the height you came
+  // from instead of jumping to max.
+  //
+  // v1.5 fix for the label: the drop height must be predicted from
+  // YouTube's menu, not from any format with that fps. A 720p30 format
+  // hidden behind a 720p60 menu entry is not selectable, so v1.4's
+  // "↓720p" label was wrong when the click landed on 480p. The menu
+  // now groups formats by height and takes the max fps per height -
+  // exactly what the native menu shows - and if that prediction is
+  // impossible it shows "↓ lower res" with no number, never a guess.
+  //
+  // v1.6 rule, learned the hard way: a manual quality choice always
+  // wins over an fps lock. v1.5 re-applied the lock after any quality
+  // change, so 144p + FPS:60 became 4K60 two seconds later. Now a
+  // quality change only keeps a lock that fits the new height exactly
+  // (same-height re-apply), otherwise the lock is cleared on the spot,
+  // and a watchdog in updateBadge clears a stale lock if the playing
+  // height changes outside the HUD too. Nothing in this script ever
+  // re-applies a lock by raising the resolution on its own.
+  //
   // Flow for a chosen fps:
   //   1. Open the player's Settings menu, open Quality, scan its entries.
   //   2. Click the best entry for that fps (same height first, then the
-  //      highest height that offers that fps).
+  //      height you came from, then the highest height that offers it).
   //   3. If the native menu is unavailable, fall back to the player API
   //      for the matching height.
   //   4. Verify against the real active fps (Stats for nerds / video
@@ -316,6 +371,107 @@
     return offered.some(f => fpsMatches(f, target));
   }
 
+  // Is `target` offered at exactly `height`, from the format list?
+  // Returns null when formats are hidden (unknown), false when the
+  // height has formats but none at that fps. A plain native label at a
+  // height is just that height's non-HFR format, so an explicit fps
+  // match is the right test here - the plain-label fallback in
+  // pickNativeFpsRow only applies when formats are hidden.
+  function fpsAtHeight(target, height) {
+    const formats = getVideoFormats();
+    if (!formats.length) return null;
+    const atHeight = formats.filter(f => f.height === height);
+    if (!atHeight.length) return false;
+    if (atHeight.some(f => f.fps && fpsMatches(f.fps, target))) return true;
+    if (atHeight.some(f => !f.fps)) return null;
+    return false;
+  }
+
+  // Highest height that offers `target` fps, or null if none / unknown.
+  // NOTE: this is deliberately NOT used for the menu label anymore.
+  // v1.4 used it, and it lied: a video can have a 720p30 format in its
+  // format list while YouTube's menu only shows 720p60 for that height,
+  // so the label said "↓720p" and the actual click landed on 480p.
+  function highestHeightForFps(target) {
+    const formats = getVideoFormats().filter(f => f.fps && fpsMatches(f.fps, target));
+    if (!formats.length) return null;
+    return Math.max(...formats.map(f => f.height));
+  }
+
+  // The player's own quality data, when it exposes it: entries with
+  // qualityLabel like "1440p60", "480p", "Auto". These are exactly the
+  // entries YouTube's native menu shows, so they are the best source
+  // for predicting what a click will actually do. Returns [] when the
+  // player does not expose this (then we fall back, honestly, to a
+  // generic warning instead of a guessed number).
+  function getQualityDataEntries() {
+    const mp = getMoviePlayer();
+    if (!mp || typeof mp.getAvailableQualityData !== 'function') return [];
+    try {
+      const data = mp.getAvailableQualityData() || [];
+      return data.map(d => {
+        const parsed = parseNativeQualityLabel(d.qualityLabel || d.label || '');
+        return parsed && parsed.height != null ? parsed : null;
+      }).filter(Boolean);
+    } catch (e) { return []; }
+  }
+
+  // Menu-equivalent fps per height, derived from formats: YouTube's
+  // menu shows ONE entry per height - the highest fps format at that
+  // height, labelled with its fps if it is HFR, plain otherwise. So a
+  // 720p30 format hidden behind a 720p60 format at the same height is
+  // NOT a selectable 720p30 entry, and must not be used for the label.
+  // Returns a Map height -> max fps (or null when fps is unknown).
+  function getMenuFpsByHeight() {
+    const byHeight = new Map();
+    getVideoFormats().forEach(f => {
+      if (!f.height) return;
+      const prev = byHeight.get(f.height);
+      if (f.fps && (!prev || f.fps > prev)) byHeight.set(f.height, f.fps);
+      else if (!byHeight.has(f.height)) byHeight.set(f.height, null);
+    });
+    return byHeight;
+  }
+
+  // Height that picking `target` will actually land on, using the same
+  // scoring as pickNativeFpsRow, but on a predicted menu instead of
+  // the live native menu. Returns null when no prediction is possible
+  // (no quality data and no formats) - the caller must then NOT claim
+  // a specific height. Returns undefined when prediction says the fps
+  // is not selectable at all.
+  function predictFpsHeight(target, preferredHeight) {
+    // Effective fps per height: from formats, this is the max fps at
+    // that height (the menu entry for that height). From quality data
+    // alone, only exact-suffix entries have a known fps; plain entries
+    // are unknown and must not be guessed at.
+    const byHeight = getMenuFpsByHeight();
+    let effective = null;
+    if (byHeight.size) {
+      effective = byHeight;
+    } else {
+      const qd = getQualityDataEntries();
+      if (!qd.length) return null;
+      effective = new Map();
+      qd.forEach(e => { if (e.fps) effective.set(e.height, e.fps); });
+      if (!effective.size) return null;
+    }
+    const candidates = [...effective.entries()]
+      .filter(([, maxFps]) => maxFps && fpsMatches(maxFps, target))
+      .map(([h]) => h);
+    if (!candidates.length) {
+      // Unknown plain entries could still be this fps, but claiming
+      // n/a would be a guess too - return null only when there are
+      // plain entries we could not resolve; otherwise it is truly n/a.
+      const hasUnknown = byHeight.size
+        ? [...byHeight.values()].some(v => v == null)
+        : getQualityDataEntries().some(e => !e.fps);
+      return hasUnknown ? null : undefined;
+    }
+    if (candidates.includes(preferredHeight)) return preferredHeight;
+    if (candidates.includes(fpsDropFromHeight)) return fpsDropFromHeight;
+    return Math.max(...candidates);
+  }
+
   function levelForHeight(height) {
     for (const [level, h] of Object.entries(LEVEL_HEIGHTS)) {
       if (h === height) return level;
@@ -323,17 +479,26 @@
     return null;
   }
 
-  // Best format for a fps: same height first, then highest height with it.
-  function formatForFps(target, preferredHeight) {
+  // Best format for a fps: same height first, then the height you came
+  // from before a drop, then the highest height with it. When
+  // allowHeightChange is false (re-applying after a manual quality
+  // change), ONLY the same height is allowed - returning a higher
+  // height here is exactly the 144p -> 4K auto-upgrade bug.
+  function formatForFps(target, preferredHeight, allowHeightChange = true) {
     const formats = getVideoFormats().filter(f => f.fps && fpsMatches(f.fps, target));
     if (!formats.length) return null;
-    const sameHeight = formats.filter(f => f.height === preferredHeight);
-    if (sameHeight.length) {
-      sameHeight.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      return sameHeight[0];
-    }
-    formats.sort((a, b) => (b.height - a.height) || ((b.bitrate || 0) - (a.bitrate || 0)));
-    return formats[0];
+    const pickAt = (height) => {
+      const at = formats.filter(f => f.height === height);
+      if (!at.length) return null;
+      at.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      return at[0];
+    };
+    const same = pickAt(preferredHeight);
+    if (same || !allowHeightChange) return same;
+    return pickAt(fpsDropFromHeight) || (() => {
+      formats.sort((a, b) => (b.height - a.height) || ((b.bitrate || 0) - (a.bitrate || 0)));
+      return formats[0];
+    })();
   }
 
   function fpsLabel(target) {
@@ -451,9 +616,9 @@
       const { height, fps } = item.parsed;
       let score = -1;
       if (height != null && fps != null && fpsMatches(fps, target)) {
-        score = height === preferredHeight ? 100 : 50;
+        score = height === preferredHeight ? 100 : height === fpsDropFromHeight ? 80 : 50;
       } else if (height != null && fps == null && plainLabelIsTarget(height)) {
-        score = height === preferredHeight ? 90 : 40;
+        score = height === preferredHeight ? 90 : height === fpsDropFromHeight ? 70 : 40;
       }
       return { ...item, score, height: height || 0 };
     }).filter(x => x.score >= 0);
@@ -462,92 +627,126 @@
     return scored.length ? scored[0] : null;
   }
 
-  async function applyFpsViaNative(target, preferredHeight) {
+  async function applyFpsViaNative(target, preferredHeight, allowHeightChange = true) {
     const qualityItems = await openNativeQualityMenu();
-    if (!qualityItems) return false;
+    if (!qualityItems) return { ok: false, height: null };
+    // Same-height-only mode: never let a re-apply change the height.
+    // Filtering here, before picking, is what stops 144p -> 4K: a
+    // 60fps row at 144p simply does not exist, so this fails cleanly
+    // instead of picking the 2160p60 row.
+    const itemsForPick = allowHeightChange
+      ? qualityItems
+      : qualityItems.filter(x => x.parsed.height === preferredHeight);
     let row = null;
     if (target == null) {
-      row = qualityItems.find(x => x.parsed.isAuto) || null;
+      // If an earlier fps choice dropped the resolution, Auto goes back
+      // to the height you came from, not to the video's max - but only
+      // when height changes are allowed at all.
+      if (allowHeightChange && fpsDropFromHeight) {
+        const atRestore = qualityItems.filter(x => x.parsed.height === fpsDropFromHeight);
+        atRestore.sort((a, b) => ((b.parsed.fps || 0) - (a.parsed.fps || 0)));
+        row = atRestore[0] || null;
+      }
+      if (!row && allowHeightChange) row = qualityItems.find(x => x.parsed.isAuto) || null;
       if (!row) {
         // No Auto row (already on a fixed quality): fall back to the
         // highest-fps row at the current height, which is what Auto
         // would pick for that height anyway.
-        const atHeight = qualityItems.filter(x => x.parsed.height === preferredHeight);
+        const atHeight = itemsForPick.filter(x => x.parsed.height === preferredHeight);
         atHeight.sort((a, b) => ((b.parsed.fps || 0) - (a.parsed.fps || 0)));
         row = atHeight[0] || null;
       }
     } else {
-      row = pickNativeFpsRow(qualityItems, target, preferredHeight);
+      row = pickNativeFpsRow(itemsForPick, target, preferredHeight);
     }
-    if (!row) { await closeNativeMenu(); return false; }
+    if (!row) { await closeNativeMenu(); return { ok: false, height: null }; }
     row.row.click();
     await waitFor(() => !nativeSettingsMenu(), 800, 100);
-    return true;
+    return { ok: true, height: row.parsed.height || null };
   }
 
-  function applyFpsViaApi(target, preferredHeight) {
+  function applyFpsViaApi(target, preferredHeight, allowHeightChange = true) {
     const mp = getMoviePlayer();
-    if (!mp) return false;
+    if (!mp) return { ok: false, height: null };
     try {
       if (target == null) {
-        // Keep the current resolution level, just stop forcing a fps.
-        let level = '';
-        if (typeof mp.getPlaybackQuality === 'function') level = mp.getPlaybackQuality() || '';
+        // Keep the current resolution level, just stop forcing a fps -
+        // unless an earlier fps choice dropped it, in which case go
+        // back to the height you came from (only when height changes
+        // are allowed).
+        let level = (allowHeightChange && fpsDropFromHeight) ? (levelForHeight(fpsDropFromHeight) || '') : '';
+        if (!level && typeof mp.getPlaybackQuality === 'function') level = mp.getPlaybackQuality() || '';
         if (!level && preferredHeight) level = levelForHeight(preferredHeight) || '';
         if (level && typeof mp.setPlaybackQualityRange === 'function') {
           mp.setPlaybackQualityRange(level, level);
         }
         if (level && typeof mp.setPlaybackQuality === 'function') mp.setPlaybackQuality(level);
-        return !!level;
+        return { ok: !!level, height: LEVEL_HEIGHTS[level] || null };
       }
-      const format = formatForFps(target, preferredHeight);
-      if (!format) return false;
+      const format = formatForFps(target, preferredHeight, allowHeightChange);
+      if (!format) return { ok: false, height: null };
       const level = levelForHeight(format.height);
-      if (!level) return false;
+      if (!level) return { ok: false, height: null };
       if (typeof mp.setPlaybackQualityRange === 'function') mp.setPlaybackQualityRange(level, level);
       if (typeof mp.setPlaybackQuality === 'function') mp.setPlaybackQuality(level);
-      return true;
-    } catch (e) { return false; }
+      return { ok: true, height: format.height };
+    } catch (e) { return { ok: false, height: null }; }
   }
 
-  function verifyFps(target, videoId, attempt) {
+  function verifyFps(target, videoId, attempt, allowHeightChange = true) {
     updateBadge();
     const active = getActiveSpecs();
     const ok = target == null || (active && fpsMatches(active.fps, target));
-    console.log('[YT-HUD v1.3] fps verify', JSON.stringify({ target, activeFps: active ? active.fps : null, ok, attempt }));
+    console.log('[YT-HUD v1.6] fps verify', JSON.stringify({ target, activeFps: active ? active.fps : null, activeHeight: active ? active.height : null, ok, attempt }));
     if (ok) {
       fpsApplying = false;
+      if (active) fpsLockedHeight = active.height;
+      // If we are back at (or above) the height we dropped from, the
+      // drop is undone - forget it so later choices are not biased.
+      if (fpsDropFromHeight && active && active.height >= fpsDropFromHeight) fpsDropFromHeight = null;
+      if (target == null) fpsDropFromHeight = null;
       return;
     }
     // Retry once via the native menu, then give up honestly: drop the
     // lock so the button shows Auto instead of a fps that is not playing.
+    // A same-height-only retry must never become an upgrade retry.
     if (attempt < 1 && fpsVideoId === videoId && fpsTarget === target && fpsIsOffered(target)) {
       fpsApplyAttempts++;
       setTimeout(() => {
-        if (fpsVideoId === videoId && fpsTarget === target) applyFps(target, attempt + 1);
+        if (fpsVideoId === videoId && fpsTarget === target) applyFps(target, attempt + 1, allowHeightChange);
       }, 500);
     } else {
       fpsApplying = false;
       if (fpsVideoId === videoId && fpsTarget === target) {
         fpsTarget = null;
-        console.log('[YT-HUD v1.3] fps not available after retry, lock cleared');
+        fpsLockedHeight = null;
+        console.log('[YT-HUD v1.6] fps not available after retry, lock cleared');
         updateBadge();
       }
     }
   }
 
-  async function applyFps(target, attempt) {
+  async function applyFps(target, attempt, allowHeightChange = true) {
     const videoId = getCurrentVideoId();
     const active = getActiveSpecs();
     const preferredHeight = active ? active.height : null;
     fpsApplying = true;
     fpsLastApplyAt = Date.now();
-    const viaNative = await applyFpsViaNative(target, preferredHeight);
-    let applied = viaNative;
-    if (!applied) applied = applyFpsViaApi(target, preferredHeight);
-    console.log('[YT-HUD v1.3] fps apply', JSON.stringify({ target, viaNative, viaApi: applied && !viaNative, preferredHeight }));
+    const nativeResult = await applyFpsViaNative(target, preferredHeight, allowHeightChange);
+    let result = nativeResult;
+    if (!result.ok) result = applyFpsViaApi(target, preferredHeight, allowHeightChange);
+    // Remember a drop, so going back restores it. A chosen height
+    // below the one we started at is a drop; a chosen height at/above
+    // the remembered drop height undoes it. In same-height-only mode
+    // result.height can never differ from preferredHeight, so no drop
+    // (and no upgrade) is recorded here.
+    if (result.ok && result.height && preferredHeight && result.height < preferredHeight && !fpsDropFromHeight) {
+      fpsDropFromHeight = preferredHeight;
+    }
+    if (target == null) fpsDropFromHeight = null;
+    console.log('[YT-HUD v1.6] fps apply', JSON.stringify({ target, viaNative: nativeResult.ok, viaApi: result.ok && !nativeResult.ok, preferredHeight, chosenHeight: result.height, dropFromHeight: fpsDropFromHeight, allowHeightChange }));
     // Give the player time to switch streams, then check the real fps.
-    setTimeout(() => { if (fpsVideoId === videoId) verifyFps(target, videoId, attempt || 0); }, 1500);
+    setTimeout(() => { if (fpsVideoId === videoId) verifyFps(target, videoId, attempt || 0, allowHeightChange); }, 1500);
     setTimeout(updateBadge, 500);
     setTimeout(updateBadge, 2500);
   }
@@ -557,10 +756,13 @@
     const videoId = getCurrentVideoId();
     fpsVideoId = videoId;
     fpsTarget = target;
+    fpsLockedHeight = null;
     fpsApplyAttempts = 0;
     // If a previous apply is still in flight, its verify step checks
     // fpsTarget/videoId and will not clear this new choice.
-    applyFps(target, 0);
+    // Explicit fps clicks DO allow a height change - but only the one
+    // the menu already warned about (↓480p / ↑2160p).
+    applyFps(target, 0, true);
     updateBadge();
   }
 
@@ -588,6 +790,7 @@
     menu.style.boxShadow = '0 8px 24px rgba(0,0,0,0.55)';
     menu.style.overflow = 'hidden';
 
+    const activeHeight = active ? active.height : null;
     const header = document.createElement('div');
     header.textContent = activeFps ? `Playing: ${activeFps}fps` : 'FPS';
     header.style.padding = '9px 16px 5px';
@@ -596,6 +799,14 @@
     header.style.letterSpacing = '0.5px';
     header.style.textTransform = 'uppercase';
     menu.appendChild(header);
+    if (fpsDropFromHeight && activeHeight && activeHeight < fpsDropFromHeight) {
+      const note = document.createElement('div');
+      note.textContent = `Dropped from ${fpsDropFromHeight}p - pick 60 or Auto to go back`;
+      note.style.padding = '0 16px 5px';
+      note.style.fontSize = '11px';
+      note.style.color = '#f9ab00';
+      menu.appendChild(note);
+    }
 
     const entries = [{ target: null, text: 'Auto' }].concat(
       FPS_OPTIONS.map(fps => ({ target: fps, text: `${fps} fps` }))
@@ -603,12 +814,49 @@
 
     entries.forEach(entry => {
       const isCurrent = entry.target === fpsTarget;
-      const offered = entry.target == null || fpsIsOffered(entry.target);
+      // v1.4: an fps is not just "offered somewhere" - if it is not
+      // offered at the current height, say so and say where it drops to,
+      // instead of silently dropping the resolution on click.
+      let offered = true;
+      let suffix = '';
+      let title = '';
+      if (entry.target != null) {
+        // v1.5: predict from the menu-equivalent heights, NOT from any
+        // format with that fps. A 720p30 format hidden behind 720p60
+        // must not produce a "↓720p" label when the click will land
+        // on 480p. If prediction is impossible, show a generic warning
+        // with no number, rather than a wrong number.
+        const predicted = activeHeight ? predictFpsHeight(entry.target, activeHeight) : null;
+        if (predicted === undefined) {
+          offered = false;
+          suffix = activeHeight ? ` \u00b7 n/a at ${activeHeight}p` : ' \u00b7 n/a';
+        } else if (predicted === null) {
+          // Unknown (formats/quality data hidden): clickable, native
+          // menu will decide. If formats at least say this fps exists
+          // somewhere, warn generically that it may drop resolution.
+          offered = fpsIsOffered(entry.target);
+          if (!offered) {
+            suffix = ' \u00b7 n/a';
+          } else if (activeHeight && !fpsAtHeight(entry.target, activeHeight)) {
+            suffix = ' \u00b7 \u2193 lower res';
+            title = 'Not offered at this height - will drop to a lower resolution';
+          }
+        } else if (predicted === activeHeight) {
+          offered = true;
+        } else {
+          offered = true;
+          const arrow = predicted < activeHeight ? '\u2193' : '\u2191';
+          const verb = predicted < activeHeight ? 'drop' : 'switch';
+          suffix = ` \u00b7 ${arrow}${predicted}p`;
+          title = `Not offered at ${activeHeight}p - will ${verb} to ${predicted}p`;
+        }
+      }
       const item = document.createElement('div');
-      item.textContent = (isCurrent ? '\u2713 ' : '') + entry.text + (offered ? '' : ' \u00b7 n/a');
+      item.textContent = (isCurrent ? '\u2713 ' : '') + entry.text + suffix;
+      if (title) item.title = title;
       item.style.padding = '9px 16px';
       item.style.fontSize = '13px';
-      item.style.color = offered ? '#fff' : '#888';
+      item.style.color = offered ? (suffix ? '#f9ab00' : '#fff') : '#888';
       item.style.cursor = offered ? 'pointer' : 'default';
       item.style.fontWeight = isCurrent ? '600' : '400';
       item.style.backgroundColor = isCurrent ? 'rgba(255,255,255,0.12)' : 'transparent';
@@ -851,12 +1099,32 @@
     if (fpsVideoId !== currentVideoId) {
       fpsVideoId = currentVideoId;
       fpsTarget = null;
+      fpsDropFromHeight = null;
+      fpsLockedHeight = null;
       fpsApplying = false;
       fpsApplyAttempts = 0;
     }
 
     const maxSpecs = getMaxSpecs();
     const activeSpecs = getActiveSpecs();
+
+    // Watchdog for quality changes made outside the HUD (native menu,
+    // YouTube adapting): if a verified lock was playing at one height
+    // and the video is now playing at a different height with a
+    // different fps, that change wins. Do NOT re-apply the lock here -
+    // re-applying is exactly what would drag 144p back up to 4K.
+    // The 4-second grace after an apply lets the switch settle first.
+    if (fpsTarget != null && !fpsApplying && fpsLockedHeight != null && activeSpecs &&
+        activeSpecs.height !== fpsLockedHeight && Date.now() - fpsLastApplyAt > 4000) {
+      if (activeSpecs.fps && fpsMatches(activeSpecs.fps, fpsTarget)) {
+        fpsLockedHeight = activeSpecs.height;
+      } else {
+        console.log('[YT-HUD v1.6] playing height changed, fps lock cleared (manual quality wins)', JSON.stringify({ fpsTarget, wasHeight: fpsLockedHeight, nowHeight: activeSpecs.height, nowFps: activeSpecs.fps }));
+        fpsTarget = null;
+        fpsDropFromHeight = null;
+        fpsLockedHeight = null;
+      }
+    }
 
     const built = buildUI();
 
@@ -876,7 +1144,7 @@
     });
     if (dbg !== lastDebug) {
       lastDebug = dbg;
-      console.log('[YT-HUD v1.3]', dbg);
+      console.log('[YT-HUD v1.6]', dbg);
     }
 
     if (!built) return;
@@ -902,14 +1170,19 @@
     }
 
     if (flabel) {
-      const fText = fpsLabel(fpsTarget);
+      let fText = fpsLabel(fpsTarget);
+      // Make a drop visible on the button itself, not just in the menu:
+      // "FPS: 30 ↓480p" instead of a bare "FPS: 30" next to a 480p badge.
+      if (fpsTarget != null && fpsDropFromHeight && activeSpecs && activeSpecs.height < fpsDropFromHeight) {
+        fText = `FPS: ${fpsTarget} \u2193${activeSpecs.height}p`;
+      }
       if (flabel.textContent !== fText) flabel.textContent = fText;
     }
 
     const darkNow = applyTheme();
     if (lastTheme !== darkNow) {
       lastTheme = darkNow;
-      console.log('[YT-HUD v1.3] theme:', darkNow ? 'dark' : 'light');
+      console.log('[YT-HUD v1.6] theme:', darkNow ? 'dark' : 'light');
     }
 
 

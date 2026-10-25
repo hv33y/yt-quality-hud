@@ -62,6 +62,7 @@ These are YouTube's limits, not the script's, and the menu is built to show them
 - **23 and 24fps share a stream.** 23.976fps cinema content is reported by YouTube as 24 in most places, so both options are listed but may land on the same stream.
 - **Unavailable at this height shows as `n/a at 1440p`** (or whatever you're playing at), instead of silently switching you somewhere else.
 - **Manual quality always wins.** Changing quality clears an FPS lock unless that FPS fits the new height exactly — picking 144p with an FPS:60 lock on will not drag you back up to 4K a few seconds later. Going back to 60fps or Auto after a drop restores the height you came from, not the video's maximum.
+- **Premium entries are only clicked for Premium users.** `1080p Premium / Enhanced bitrate` is a paid bitrate tier, not a different FPS or resolution — the regular `1080p` entry at the same height gives you the exact FPS you asked for. Clicking Premium as a non-Premium user just opens YouTube's Premium upsell popup instead of switching streams, so the switcher prefers the regular entry, and if only Premium matches, it doesn't click it at all. If you *are* Premium, the switcher bumps you up to the Premium entry at the same height/fps instead — it detects that from a currently selected Premium row (only a Premium user can actually be playing one) and remembers it, and the FPS menu has a `Premium: Auto / On / Off` row if detection ever misses you and you want to force it on (or force regular).
 
 ## Author
 
